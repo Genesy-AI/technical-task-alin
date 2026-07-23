@@ -3,17 +3,8 @@ export type LeadsVerifyEmailsInput = {
 }
 
 export type LeadsVerifyEmailsOutput = {
-  success: boolean
-  verifiedCount: number
-  results: Array<{
-    leadId: number
-    emailVerified: boolean | null
-  }>
-  errors: Array<{
-    leadId: number
-    leadName: string
-    error: string
-  }>
+  // Leads for which a verification workflow was started.
+  started: number[]
+  // Leads skipped because a verification is already in flight (or could not start).
+  skipped: number[]
 }
-
-

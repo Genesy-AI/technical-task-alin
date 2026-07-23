@@ -5,6 +5,8 @@ import { api } from '../api'
 import { MessageTemplateModal } from './MessageTemplateModal'
 import { CsvImportModal } from './CsvImportModal'
 
+const EMAIL_VERIFICATION = 'EMAIL_VERIFICATION'
+
 export const LeadsList: FC = () => {
   const [selectedLeads, setSelectedLeads] = useState<number[]>([])
   const [isMessageModalOpen, setIsMessageModalOpen] = useState(false)
@@ -16,8 +18,16 @@ export const LeadsList: FC = () => {
     queryKey: ['leads', 'getMany'],
     queryFn: async () => api.leads.getMany(),
     retry: false,
+    // Poll while any email verification is still in flight; stop automatically
+    // once every lead has reached a terminal state.
+    refetchInterval: (query) => {
+      const hasPending = query.state.data?.some((lead) =>
+        lead.enrichments?.some((e) => e.type === EMAIL_VERIFICATION && e.status === 'PENDING')
+      )
+      return hasPending ? 2000 : false
+    },
   })
-  
+
 
   const deleteLeadsMutation = useMutation({
     mutationFn: async (ids: number[]) => api.leads.deleteMany({ ids }),
@@ -38,13 +48,22 @@ export const LeadsList: FC = () => {
   const verifyEmailsMutation = useMutation({
     mutationFn: async (ids: number[]) => api.leads.verifyEmails({ leadIds: ids }),
     onSuccess: (data) => {
+      // Verification runs asynchronously; refetch so the "Verifying…" state (and
+      // polling) kick in immediately. Keep the dropdown open and the leads
+      // selected so only the Verify Email option is disabled while any selected
+      // lead is still verifying.
       queryClient.invalidateQueries({ queryKey: ['leads', 'getMany'] })
-      setIsEnrichDropdownOpen(false)
-      toast.success(
-        data.verifiedCount === 1
-          ? `Verified ${data.verifiedCount} email`
-          : `Verified ${data.verifiedCount} emails`
-      )
+
+      if (data.started.length > 0) {
+        toast.success(
+          data.started.length === 1
+            ? 'Verification started for 1 lead'
+            : `Verification started for ${data.started.length} leads`
+        )
+      }
+      if (data.skipped.length > 0) {
+        toast(`${data.skipped.length} already verifying, skipped`)
+      }
     },
     onError: () => {
       toast.error('Failed to verify emails. Please try again.')
@@ -92,6 +111,12 @@ export const LeadsList: FC = () => {
 
   const isAllSelected = leads.data && selectedLeads.length === leads.data.length
   const isIndeterminate = selectedLeads.length > 0 && selectedLeads.length < (leads.data?.length || 0)
+
+  const selectedLeadsData = leads.data?.filter((lead) => selectedLeads.includes(lead.id)) ?? []
+  const anySelectedVerifying = selectedLeadsData.some((lead) =>
+    lead.enrichments?.some((e) => e.type === EMAIL_VERIFICATION && e.status === 'PENDING')
+  )
+  const isVerifyDisabled = verifyEmailsMutation.isPending || anySelectedVerifying
 
   return (
     <div className="bg-white rounded-lg shadow-sm border border-gray-200 flex flex-col h-[calc(100vh-12rem)]">
@@ -149,13 +174,18 @@ export const LeadsList: FC = () => {
                     </button>
                     <button
                       onClick={() => verifyEmailsMutation.mutate(selectedLeads)}
-                      className="block w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-100 transition-colors"
+                      disabled={isVerifyDisabled}
+                      className="block w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-100 transition-colors disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-transparent"
                     >
                       <div className="flex items-center">
                         <svg className="mr-3 h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 12H8m8 0a8 8 0 11-16 0 8 8 0 0116 0zm-8 0V4" />
                         </svg>
-                        Verify Email
+                        {verifyEmailsMutation.isPending
+                          ? 'Starting…'
+                          : anySelectedVerifying
+                            ? 'Verifying…'
+                            : 'Verify Email'}
                       </div>
                     </button>
                     <button
@@ -264,7 +294,31 @@ export const LeadsList: FC = () => {
                     </div>
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap">
-                    <div className="text-sm text-gray-900">{lead.email || '-'} {lead.emailVerified === null ? '❓' : lead.emailVerified ? '✅' : '❌'}</div>
+                    <div className="text-sm text-gray-900 flex items-center gap-2">
+                      <span>{lead.email || '-'}</span>
+                      {(() => {
+                        const enrichment = lead.enrichments?.find((e) => e.type === EMAIL_VERIFICATION)
+                        if (enrichment?.status === 'PENDING') {
+                          return (
+                            <span className="inline-flex items-center gap-1 text-xs text-blue-600">
+                              <svg className="animate-spin h-3 w-3" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                              </svg>
+                              Verifying…
+                            </span>
+                          )
+                        }
+                        if (enrichment?.status === 'FAILED') {
+                          return (
+                            <span className="text-xs text-amber-600" title={enrichment.error || 'Verification failed'}>
+                              ⚠️ Failed
+                            </span>
+                          )
+                        }
+                        return <span>{lead.emailVerified === null ? '❓' : lead.emailVerified ? '✅' : '❌'}</span>
+                      })()}
+                    </div>
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap">
                     <div className="text-sm text-gray-900">{lead.jobTitle || '-'}</div>

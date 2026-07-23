@@ -1,7 +1,8 @@
 import { PrismaClient } from '@prisma/client'
 import express, { Request, Response } from 'express'
-import { Connection, Client } from '@temporalio/client'
+import { Connection, Client, WorkflowExecutionAlreadyStartedError } from '@temporalio/client'
 import { verifyEmailWorkflow } from './workflows'
+import { EMAIL_VERIFICATION } from './workflows/activities'
 import { generateMessageFromTemplate } from './utils/messageGenerator'
 import { runTemporalWorker } from './worker'
 const prisma = new PrismaClient()
@@ -49,7 +50,13 @@ app.get('/leads/:id', async (req: Request, res: Response) => {
 })
 
 app.get('/leads', async (req: Request, res: Response) => {
-  const leads = await prisma.lead.findMany()
+  const leads = await prisma.lead.findMany({
+    include: {
+      enrichments: {
+        select: { type: true, status: true, error: true },
+      },
+    },
+  })
 
   res.json(leads)
 })
@@ -276,37 +283,61 @@ app.post('/leads/verify-emails', async (req: Request, res: Response) => {
     const connection = await Connection.connect({ address: 'localhost:7233' })
     const client = new Client({ connection, namespace: 'default' })
 
-    let verifiedCount = 0
-    const results: Array<{ leadId: number; emailVerified: boolean }> = []
-    const errors: Array<{ leadId: number; leadName: string; error: string }> = []
+    // Fire-and-forget: start a workflow per lead and return immediately. The
+    // workflow durably records its own result/status, and the UI observes it by
+    // polling GET /leads. This avoids holding the HTTP request open for the
+    // (potentially long) verification provider, which would otherwise hit
+    // gateway/browser idle timeouts.
+    const started: number[] = []
+    const skipped: number[] = []
 
     for (const lead of leads) {
+      const existing = await prisma.enrichment.findUnique({
+        where: { leadId_type: { leadId: lead.id, type: EMAIL_VERIFICATION } },
+      })
+
+      // Skip leads with an in-flight verification to avoid duplicate concurrent runs.
+      if (existing?.status === 'PENDING') {
+        skipped.push(lead.id)
+        continue
+      }
+
+      const workflowId = `verify-email-${lead.id}`
+
+      await prisma.enrichment.upsert({
+        where: { leadId_type: { leadId: lead.id, type: EMAIL_VERIFICATION } },
+        create: { leadId: lead.id, type: EMAIL_VERIFICATION, status: 'PENDING', workflowId },
+        update: { status: 'PENDING', error: null, workflowId },
+      })
+
       try {
-        const isVerified = await client.workflow.execute(verifyEmailWorkflow, {
+        await client.workflow.start(verifyEmailWorkflow, {
           taskQueue: 'myQueue',
-          workflowId: `verify-email-${lead.id}-${Date.now()}`,
-          args: [lead.email],
+          workflowId,
+          args: [lead.id, lead.email],
         })
-
-        await prisma.lead.update({
-          where: { id: lead.id },
-          data: { emailVerified: Boolean(isVerified) },
-        })
-
-        results.push({ leadId: lead.id, emailVerified: isVerified })
-        verifiedCount += 1
+        started.push(lead.id)
       } catch (error) {
-        errors.push({
-          leadId: lead.id,
-          leadName: `${lead.firstName} ${lead.lastName}`.trim(),
-          error: error instanceof Error ? error.message : 'Unknown error',
-        })
+        if (error instanceof WorkflowExecutionAlreadyStartedError) {
+          // A run for this lead is already in progress — leave it be.
+          skipped.push(lead.id)
+        } else {
+          // The workflow never started; don't leave the row stranded in PENDING.
+          await prisma.enrichment.update({
+            where: { leadId_type: { leadId: lead.id, type: EMAIL_VERIFICATION } },
+            data: {
+              status: 'FAILED',
+              error: error instanceof Error ? error.message : 'Failed to start verification',
+            },
+          })
+          skipped.push(lead.id)
+        }
       }
     }
 
     await connection.close()
 
-    res.json({ success: true, verifiedCount, results, errors })
+    res.status(202).json({ started, skipped })
   } catch (error) {
     console.error('Error verifying emails:', error)
     res.status(500).json({ error: 'Failed to verify emails' })

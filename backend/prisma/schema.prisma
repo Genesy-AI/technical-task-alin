@@ -19,4 +19,24 @@ model lead {
   companyName String?
   message     String?
   emailVerified Boolean?
+  enrichments Enrichment[]
+}
+
+// Tracks the lifecycle (status) of async enrichment jobs per lead + feature.
+// The result of each enrichment lives on the lead itself (e.g. `emailVerified`);
+// this table only owns the "pending / completed / failed" state so the leads
+// table is not polluted with a status column per feature.
+model Enrichment {
+  id         Int      @id @default(autoincrement())
+  leadId     Int
+  lead       lead     @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  type       String // 'EMAIL_VERIFICATION' | future types
+  status     String // 'PENDING' | 'COMPLETED' | 'FAILED'
+  error      String?
+  workflowId String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([leadId, type]) // one latest lifecycle row per (lead, feature); upsert + dedupe
+  @@index([leadId])
 }

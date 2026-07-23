@@ -14,6 +14,9 @@ dist
 dist-ssr
 *.local
 
+# Local SQLite dev database
+prisma/dev.db
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
